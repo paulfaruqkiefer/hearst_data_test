@@ -1,0 +1,853 @@
+---
+title: "hearst_data_test"
+author: "Paul Kiefer"
+date: "2026-02-04"
+output: html_document
+---
+
+LOAD LIBRARIES:
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Core & Manipulation
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(stringr)
+library(readxl)
+
+# Spatial & Census
+library(sf)
+library(tigris)
+library(tidycensus)
+library(tidygeocoder)
+
+# Visualization
+library(gridExtra)
+library(leaflet)
+library(htmltools)
+library(scales)
+
+
+# CONFIGURATION
+# Set to TRUE to re-run geocoding (takes time). Set to FALSE to skip if data exists.
+RUN_GEOCODING <- TRUE
+```
+
+LOAD AND CLEAN DATA:
+
+* INVOLVES CUSTOM CLEANING AND FOOTNOTE-PRESERVING FUNCTIONS*
+
+```{r}
+
+# ------------------------------
+# Function to clean a single offenses dataset
+# ------------------------------
+clean_offenses <- function(path, skip_rows = 3, rename_arson = FALSE) {
+  df <- read_xlsx(path, skip = skip_rows) %>%
+    clean_names() %>%
+    mutate(
+      # Extract footnotes from state and city
+      state_footnote = str_extract(state, "\\d+"),
+      city_footnote  = str_extract(city, "\\d+"),
+      
+      # Remove footnote numbers
+      state = str_remove(state, "\\d+"),
+      city  = str_remove(city, "\\d+"),
+      
+      # Capitalize
+      state = str_to_upper(state),
+      city  = str_to_upper(city)
+    ) %>%
+    fill(state, .direction = "down")  # Only fill state structurally
+
+  
+  return(df)
+}
+```
+
+```{r}
+# ------------------------------
+# Function to build footnotes table from cleaned dataset
+# ------------------------------
+build_footnotes <- function(df) {
+  
+  # Footnote rows: only rows with footnote number and text ending with a period
+  state_footnote_rows <- df %>%
+    filter(!is.na(state_footnote) & str_detect(state, "\\.$")) %>%
+    transmute(footnote_number = state_footnote, footnote = state)
+  
+  city_footnote_rows <- df %>%
+    filter(!is.na(city_footnote) & str_detect(city, "\\.$")) %>%
+    transmute(footnote_number = city_footnote, footnote = city)
+  
+  footnote_rows <- bind_rows(state_footnote_rows, city_footnote_rows) %>%
+    distinct(footnote_number, footnote)
+  
+  # All states linked to each footnote
+  state_locations <- df %>%
+    filter(!is.na(state_footnote) & !str_detect(state, "\\.$")) %>%
+    distinct(state_footnote, state) %>%
+    group_by(state_footnote) %>%
+    summarize(states = paste(sort(unique(state)), collapse = ", "), .groups = "drop") %>%
+    rename(footnote_number = state_footnote)
+  
+  # All cities linked to each footnote
+  city_locations <- df %>%
+    filter(!is.na(city_footnote) & !str_detect(city, "\\.$")) %>%
+    mutate(city_state = paste0(city, ", ", state)) %>%
+    distinct(city_footnote, city_state) %>%
+    group_by(city_footnote) %>%
+    summarize(cities = paste(sort(unique(city_state)), collapse = "; "), .groups = "drop") %>%
+    rename(footnote_number = city_footnote)
+  
+  # Combine footnote text, states, cities
+  footnotes <- footnote_rows %>%
+    left_join(state_locations, by = "footnote_number") %>%
+    left_join(city_locations, by = "footnote_number") %>%
+    arrange(as.integer(footnote_number))
+  
+  return(footnotes)
+}
+
+
+```
+
+```{r}
+# ------------------------------
+# Apply cleaning and footnote functions to all years
+# ------------------------------
+offenses_2024 <- clean_offenses(
+  "data/fbi-cde-city-offenses/CIUS_Table_8_Offenses_Known_to_Law_Enforcement_by_State_by_City_2024.xlsx",
+  skip_rows = 3
+)
+footnotes_2024 <- build_footnotes(offenses_2024)
+
+offenses_2023 <- clean_offenses(
+  "data/fbi-cde-city-offenses/CIUS_Table_8_Offenses_Known_to_Law_Enforcement_by_State_by_City_2023.xlsx",
+  skip_rows = 3
+)
+footnotes_2023 <- build_footnotes(offenses_2023)
+
+offenses_2022 <- clean_offenses(
+  "data/fbi-cde-city-offenses/CIUS_Table_8_Offenses_Known_to_Law_Enforcement_by_State_by_City_2022.xlsx",
+  skip_rows = 3
+)
+footnotes_2022 <- build_footnotes(offenses_2022)
+
+offenses_2021 <- clean_offenses(
+  "data/fbi-cde-city-offenses/CIUS_Table_8_Offenses_Known_to_Law_Enforcement_by_State_by_City_2021.xlsx",
+  skip_rows = 3,
+  rename_arson = TRUE
+)
+footnotes_2021 <- build_footnotes(offenses_2021)
+
+offenses_2020 <- clean_offenses(
+  "data/fbi-cde-city-offenses/CIUS_Table_8_Offenses_Known_to_Law_Enforcement_by_State_by_City_2020.xlsx",
+  skip_rows = 5
+)
+footnotes_2020 <- build_footnotes(offenses_2020)
+```
+
+JOIN OFFENSE TABLES 
+
+* STANDARDIZE COLUMNS AND PRESERVE YEARS *
+
+```{r}
+# ------------------------------
+# Helper function to standardize column names
+# ------------------------------
+standardize_offense_columns <- function(df) {
+  df %>%
+    # Remove any trailing numbers or underscores from column names
+    rename_with(~ str_remove_all(., "_?\\d+$")) %>%
+    
+    # Explicitly rename total columns if they exist
+    rename_with(~ ifelse(. == "violent_crime", "violent_crime_total", .)) %>%
+    rename_with(~ ifelse(. == "property_crime", "property_crime_total", .))
+}
+
+
+# ------------------------------
+# Helper function to prepare a single offenses table
+# ------------------------------
+prepare_offenses <- function(df, year) {
+  df %>%
+    select(-state_footnote, -city_footnote) %>%  # remove footnote columns
+    mutate(year = year) %>%                      # add year column
+    standardize_offense_columns()                # standardize column names
+}
+
+# ------------------------------
+# Apply to each year
+# ------------------------------
+offenses_2024_clean <- prepare_offenses(offenses_2024, 2024)
+offenses_2023_clean <- prepare_offenses(offenses_2023, 2023)
+offenses_2022_clean <- prepare_offenses(offenses_2022, 2022)
+offenses_2021_clean <- prepare_offenses(offenses_2021, 2021)
+offenses_2020_clean <- prepare_offenses(offenses_2020, 2020)
+
+# ------------------------------
+# Combine into a single dataset
+# ------------------------------
+offenses_all_years <- bind_rows(
+  offenses_2020_clean,
+  offenses_2021_clean,
+  offenses_2022_clean,
+  offenses_2023_clean,
+  offenses_2024_clean
+)
+```
+
+PULL ACS DATA FOR 2020-2024 AT CITY LEVEL 
+
+* FOCUS ON POPULATION, AGE, INCOME AND HOUSING STATS *
+
+```{r}
+
+#--------------------------------------------------------
+# FETCH & CLEAN CENSUS (ACS) DATA
+#--------------------------------------------------------
+# Years to pull
+acs_years <- 2020:2024
+
+# Variables to pull (these hold across 2020–2024)
+acs_vars <- list(
+  population    = "B01001_001",
+  median_age    = "B01002_001",
+  median_income = "B06011_001",
+  renter_units  = "B25012_010",
+  owner_units   = "B25012_002",
+  vacant_units  = "B25002_003"
+)
+
+# -----------------------------
+# Function: Safe Variable Fetch
+# -----------------------------
+# Pulls a single variable (e.g., median income) for a specific year.
+# Returns a clean dataframe with just GEOID, NAME, and the variable.
+get_acs_variable <- function(acs_year, var_name, var_code) {
+  message("Pulling ", var_name, " for ACS year: ", acs_year)
+  
+  df <- get_acs(
+    geography = "place",
+    variables = c(temp = var_code),
+    year = acs_year,
+    survey = "acs5",
+    geometry = FALSE,
+    output = "wide"
+  ) %>%
+    rename(!!var_name := tempE) %>%
+    select(GEOID, NAME, !!var_name)
+  
+  return(df)
+}
+
+# -----------------------------
+# Function: Fetch All Vars for One Year
+# -----------------------------
+# Loops through all variables in `acs_vars`, fetches them, and joins them.
+# Also cleans the city/state names to match FBI format (UPPERCASE).
+get_city_acs_year <- function(acs_year) {
+  # 1. Fetch each variable individually
+  dfs <- lapply(names(acs_vars), function(var_name) {
+    get_acs_variable(acs_year, var_name, acs_vars[[var_name]])
+  })
+  
+  # 2. Merge all variable dataframes by GEOID
+  df_year <- Reduce(function(x, y) full_join(x, y, by = c("GEOID", "NAME")), dfs)
+  
+  # 3. Clean Geography Names
+  # Splits "Portland city, Oregon" -> City: "PORTLAND", State: "OREGON"
+  df_year <- df_year %>%
+    separate(NAME, into = c("city_raw", "state_name"), sep = ", ", extra = "merge") %>%
+    mutate(
+      city = str_remove(city_raw, "\\s+(town|city|village|CDP)$") %>% str_to_upper(),
+      state_name = str_to_upper(state_name)
+    ) %>%
+    select(-city_raw) %>%
+    # 4. Attach State FIPS codes (critical for accurate joining later)
+    left_join(
+      tigris::states(cb = TRUE) %>%
+        st_drop_geometry() %>%
+        select(state_name = NAME, state_fips = STATEFP) %>%
+        mutate(state_name = str_to_upper(state_name)),
+      by = "state_name"
+    )
+  
+  df_year <- df_year %>% mutate(acs_year = acs_year)
+  
+  return(df_year)
+}
+
+# -----------------------------
+# Execute Fetch Loop
+# -----------------------------
+# This runs the functions above for every year in your range
+acs_data_list <- lapply(acs_years, get_city_acs_year)
+names(acs_data_list) <- acs_years
+
+
+#----------------------------------------------------------
+# SECTION 2: CALCULATE DERIVED METRICS & JOIN TO CRIME DATA
+# ---------------------------------------------------------
+
+# -----------------------------
+# Step 1: Prepare ACS data
+# -----------------------------
+# Calculates housing percentages (Owner/Renter/Vacant) before merging
+acs_data_prepped <- lapply(acs_data_list, function(df) {
+  df %>%
+    mutate(
+      total_housing_units = renter_units + owner_units + vacant_units,
+      pct_renter = if_else(total_housing_units > 0, renter_units / total_housing_units * 100, NA_real_),
+      pct_owner  = if_else(total_housing_units > 0, owner_units  / total_housing_units * 100, NA_real_),
+      pct_vacant = if_else(total_housing_units > 0, vacant_units / total_housing_units * 100, NA_real_)
+    ) %>%
+    # Explicitly select state_name to ensure it survives for the join
+    select(city, state_name, state_fips, acs_year,
+           population, median_age, median_income,
+           total_housing_units, pct_renter, pct_owner, pct_vacant)
+}) 
+
+# Combine all years into one master ACS dataframe
+acs_all_years <- bind_rows(acs_data_prepped)
+
+# -----------------------------
+# Step 2: Join ACS to Offenses
+# -----------------------------
+# Merges Census data with FBI Crime data based on City, State, and Year
+
+# Safety check: Ensure population is numeric
+acs_all_years <- acs_all_years %>%
+  mutate(population = as.numeric(population))
+
+offenses_with_acs <- offenses_all_years %>%
+  # Join operation
+  left_join(
+    acs_all_years %>% rename(acs_population = population), # Rename to avoid collisions
+    by = c(
+      "city",
+      "state" = "state_name", 
+      "year"  = "acs_year"
+    )
+  ) %>%
+  # Calculate per-capita crime rates (per 1,000 residents)
+  mutate(
+    violent_crime_total  = as.numeric(violent_crime_total),
+    property_crime_total = as.numeric(property_crime_total),
+    
+    violent_crime_per_1000  = violent_crime_total / acs_population * 1000,
+    property_crime_per_1000 = property_crime_total / acs_population * 1000,
+    arson_per_1000          = arson / acs_population * 1000,
+    robbery_per_1000        = robbery / acs_population * 1000,
+    rape_per_1000           = rape / acs_population * 1000
+  )
+```
+
+JOIN WITH OFFENSE DATA TO CREATE PER CAPITA FIGURES 
+
+* ALSO JOIN AGE, INCOME AND HOUSING DATA *
+
+```{r}
+# -----------------------------
+# Step 1: Prepare ACS data
+# -----------------------------
+acs_data_prepped <- lapply(acs_data_list, function(df) {
+  df %>%
+    mutate(
+      total_housing_units = renter_units + owner_units + vacant_units,
+      pct_renter = if_else(total_housing_units > 0, renter_units / total_housing_units * 100, NA_real_),
+      pct_owner  = if_else(total_housing_units > 0, owner_units  / total_housing_units * 100, NA_real_),
+      pct_vacant = if_else(total_housing_units > 0, vacant_units / total_housing_units * 100, NA_real_)
+    ) %>%
+    # Add state_name here so it survives the selection
+    select(city, state_name, state_fips, acs_year,
+           population, median_age, median_income,
+           total_housing_units, pct_renter, pct_owner, pct_vacant)
+}) 
+
+# Combine into one dataframe
+acs_all_years <- bind_rows(acs_data_prepped)
+
+# -----------------------------
+# Step 2: Join ACS to offenses (FIXED)
+# -----------------------------
+
+# First, let's verify columns aren't character types
+acs_all_years <- acs_all_years %>%
+  mutate(population = as.numeric(population))
+
+offenses_with_acs <- offenses_all_years %>%
+  # Rename ACS population to avoid collision with FBI population
+  left_join(
+    acs_all_years %>% rename(acs_population = population), 
+    by = c(
+      "city",
+      "state" = "state_name", 
+      "year"  = "acs_year"
+    )
+  ) %>%
+  mutate(
+    # Ensure numeric types for the crime columns just in case
+    violent_crime_total = as.numeric(violent_crime_total),
+    property_crime_total = as.numeric(property_crime_total),
+    
+    # Use the specific ACS population column we renamed above
+    violent_crime_per_1000  = violent_crime_total / acs_population * 1000,
+    property_crime_per_1000 = property_crime_total / acs_population * 1000,
+    arson_per_1000          = arson / acs_population * 1000,
+    robbery_per_1000        = robbery / acs_population * 1000,
+    rape_per_1000           = rape / acs_population * 1000
+  )
+
+```
+
+
+CALCULATE CHANGES BETWEEN 2020-2024 AND IDENTIFY TOP 10 CHANGES (PROPERTY AND VIOLENT) IN EACH POPULATION CATEGORY
+
+* POPULATION CATEGORIES ARE ARBITRARY *
+
+```{r}
+# -----------------------------
+# Step 1: Prepare the 2020 vs 2024 comparison (FIXED)
+# -----------------------------
+crime_change <- offenses_with_acs %>%
+  filter(year %in% c(2020, 2024)) %>%
+  
+  # --- NEW FIX: Handle Duplicates ---
+  # If a city appears twice (e.g. Town vs City), keep the one with the larger population
+  group_by(city, state, year) %>%
+  slice_max(acs_population, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  # ----------------------------------
+
+  select(city, state, year, acs_population, violent_crime_per_1000, property_crime_per_1000) %>%
+  
+  # Pivot wider to get 2020 and 2024 on the same row
+  pivot_wider(
+    id_cols = c(city, state),
+    names_from = year,
+    values_from = c(acs_population, violent_crime_per_1000, property_crime_per_1000),
+    names_sep = "_"
+  ) %>%
+  
+  # Remove cities that don't have data for both years
+  drop_na(violent_crime_per_1000_2020, violent_crime_per_1000_2024) %>%
+  
+  mutate(
+    # Calculate absolute change in rates
+    violent_change  = violent_crime_per_1000_2024 - violent_crime_per_1000_2020,
+    property_change = property_crime_per_1000_2024 - property_crime_per_1000_2020,
+    
+    # Create the 4 categories based on 2024 population
+    # Note: We use acs_population_2024 (the column created by pivot_wider)
+    pop_category = case_when(
+      acs_population_2024 < 50000  ~ "1. Under 50k",
+      acs_population_2024 < 200000 ~ "2. 50k to 200k",
+      acs_population_2024 < 700000 ~ "3. 200k to 700k",
+      TRUE                         ~ "4. Over 700k"
+    )
+  )
+
+# -----------------------------
+# Step 2: Function to extract top/bottom 10 (FIXED)
+# -----------------------------
+get_top_changes <- function(data, change_col, base_rate_col, direction = "increase") {
+  
+  # Construct the 2020 and 2024 column names manually
+  col_2020 <- paste0(base_rate_col, "_2020")
+  col_2024 <- paste0(base_rate_col, "_2024")
+  
+  data %>%
+    filter(!is.na(pop_category)) %>%
+    group_by(pop_category) %>%
+    # Sort by the change column
+    slice_max(order_by = if(direction == "increase") !!sym(change_col) else -!!sym(change_col), n = 10) %>%
+    mutate(rank = row_number()) %>%
+    ungroup() %>%
+    # Select columns using the explicit names we constructed
+    select(
+      pop_category, 
+      rank, 
+      city, 
+      state, 
+      start_rate = !!sym(col_2020),
+      end_rate   = !!sym(col_2024),
+      change     = !!sym(change_col)
+    ) %>%
+    arrange(pop_category, rank)
+}
+
+# -----------------------------
+# Step 3: Generate the 4 Lists
+# -----------------------------
+
+# 1. Violent Crime Increases
+violent_increases <- get_top_changes(crime_change, "violent_change", "violent_crime_per_1000", "increase")
+
+# 2. Violent Crime Decreases
+violent_decreases <- get_top_changes(crime_change, "violent_change", "violent_crime_per_1000", "decrease")
+
+# 3. Property Crime Increases
+property_increases <- get_top_changes(crime_change, "property_change", "property_crime_per_1000", "increase")
+
+# 4. Property Crime Decreases
+property_decreases <- get_top_changes(crime_change, "property_change", "property_crime_per_1000", "decrease")
+
+```
+
+MAP CITIES IN TOP 10 FOR EACH CATEGORY
+
+* CATEGORIES ARE VIOLENT/INCREASE, VIOLENT/DECREASE, PROPERTY/INCREASE, AND PROPERTY/DECREASE *
+
+```{r}
+# ---------------------------------------------------------
+# Function 1: Geocode the Cities (Find Lat/Long)
+# ---------------------------------------------------------
+add_coordinates <- function(df) {
+  # check if df is empty
+  if(nrow(df) == 0) return(df)
+  
+  message("Geocoding ", nrow(df), " cities... please wait.")
+  
+  df %>%
+    # Create a search string for the geocoder
+    mutate(search_query = paste(city, state, "USA", sep = ", ")) %>%
+    # Use OSM (Nominatim) service - it is free and requires no key
+    geocode(address = search_query, method = 'osm', lat = lat, long = long) %>%
+    drop_na(lat, long) # Drop any that failed to locate
+}
+
+# ---------------------------------------------------------
+# Function 2: Create the Interactive Map
+# ---------------------------------------------------------
+create_crime_map <- function(data, title_text, metric_label) {
+  
+  if(nrow(data) == 0) {
+    message("No data available for: ", title_text)
+    return(NULL)
+  }
+  
+  # Define a color palette for the 4 Population Categories
+  # (Yellow -> Orange -> Red -> Purple)
+  pal <- colorFactor(
+    palette = c("#f1c40f", "#e67e22", "#e74c3c", "#8e44ad"),
+    domain = data$pop_category
+  )
+  
+  leaflet(data) %>%
+    addProviderTiles(providers$CartoDB.Positron) %>% # Clean grey background
+    
+    # Add the Circle Markers
+    addCircleMarkers(
+      lng = ~long, 
+      lat = ~lat,
+      radius = 8,
+      color = ~pal(pop_category),
+      stroke = TRUE, fillOpacity = 0.7, weight = 1,
+      
+      # The Tooltip (Hover)
+      label = ~paste0(rank, ". ", city, ", ", state),
+      
+      # The Popup (Click)
+      popup = ~paste0(
+        "<strong>", city, ", ", state, "</strong><br/>",
+        "Category: ", pop_category, "<br/>",
+        "Rank: ", rank, "<br/><hr>",
+        "2020 Rate: ", round(start_rate, 1), "<br/>",
+        "2024 Rate: ", round(end_rate, 1), "<br/>",
+        "<strong>Change: ", round(change, 1), "</strong>"
+      )
+    ) %>%
+    
+    # Add a Legend
+    addLegend(
+      "bottomright",
+      pal = pal,
+      values = ~pop_category,
+      title = "Population Category",
+      opacity = 1
+    ) %>%
+    
+    # Add a Title Control (Custom HTML)
+    addControl(
+      html = paste0("<h3 style='margin:0; padding:10px; background:white; opacity:0.9;'>", 
+                    title_text, "</h3>"),
+      position = "topright"
+    )
+}
+
+# ---------------------------------------------------------
+# EXECUTION: Geocode the 4 Lists
+# ---------------------------------------------------------
+# (This assumes you have already run the previous step to create these lists)
+message("Starting geocoding process...")
+
+map_data_violent_inc <- add_coordinates(violent_increases)
+map_data_violent_dec <- add_coordinates(violent_decreases)
+map_data_prop_inc    <- add_coordinates(property_increases)
+map_data_prop_dec    <- add_coordinates(property_decreases)
+
+message("Geocoding complete.")
+
+# ---------------------------------------------------------
+# VIEW MAPS
+# ---------------------------------------------------------
+
+# Map 1: Violent Crime Increases
+create_crime_map(
+  map_data_violent_inc, 
+  title_text = "Top Increases: Violent Crime (2020-2024)",
+  metric_label = "Violent Crimes per 1,000"
+)
+
+# Map 2: Violent Crime Decreases
+create_crime_map(
+  map_data_violent_dec, 
+  title_text = "Top Decreases: Violent Crime (2020-2024)",
+  metric_label = "Violent Crimes per 1,000"
+)
+
+# Map 3: Property Crime Increases
+create_crime_map(
+  map_data_prop_inc, 
+  title_text = "Top Increases: Property Crime (2020-2024)",
+  metric_label = "Property Crimes per 1,000"
+)
+
+# Map 4: Property Crime Decreases
+create_crime_map(
+  map_data_prop_dec, 
+  title_text = "Top Decreases: Property Crime (2020-2024)",
+  metric_label = "Property Crimes per 1,000"
+)
+```
+CALCULATE CORRELATION BETWEEN DEMOGRAPHIC CHANGE (POP, MEDIAN INCOME, AGE, HOUSING UNITS, RENTER SHARE) AND CHANGE IN VIOLENT/PROPERTY CRIME
+
+```{r}
+# -----------------------------
+# 1. Prepare Analysis Data
+# -----------------------------
+# Calculate change for all ACS vars and both crime types
+analysis_data <- offenses_with_acs %>%
+  filter(year %in% c(2020, 2024)) %>%
+  mutate(housing_units_per_capita = total_housing_units / acs_population) %>%
+  
+  # Deduplicate: Keep the row with the largest population per city/year
+  group_by(city, state, year) %>%
+  slice_max(acs_population, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  
+  select(city, state, year, acs_population, median_income, median_age, pct_renter, 
+         housing_units_per_capita, violent_crime_per_1000, property_crime_per_1000) %>%
+  
+  pivot_wider(
+    id_cols = c(city, state),
+    names_from = year,
+    values_from = c(acs_population, median_income, median_age, pct_renter, 
+                    housing_units_per_capita, violent_crime_per_1000, property_crime_per_1000),
+    names_sep = "_"
+  ) %>%
+  drop_na() %>%
+  mutate(
+    # Independent Variables (Predictors)
+    pop_change_pct            = (acs_population_2024 - acs_population_2020) / acs_population_2020,
+    income_change_pct         = (median_income_2024 - median_income_2020) / median_income_2020,
+    age_change                = median_age_2024 - median_age_2020,
+    housing_per_capita_change = housing_units_per_capita_2024 - housing_units_per_capita_2020,
+    pct_renter_change         = pct_renter_2024 - pct_renter_2020,
+    
+    # Dependent Variables (Outcomes)
+    violent_change_rate       = violent_crime_per_1000_2024 - violent_crime_per_1000_2020,
+    property_change_rate      = property_crime_per_1000_2024 - property_crime_per_1000_2020
+  )
+
+# Define variables for labels
+vars_to_test <- list(
+  "pop_change_pct"            = "Population Change (%)",
+  "income_change_pct"         = "Median Income Change (%)",
+  "age_change"                = "Change in Median Age",
+  "housing_per_capita_change" = "Change in Housing Units per Capita",
+  "pct_renter_change"         = "Change in % Renter"
+)
+
+# -----------------------------
+# 2. Violent Crime Analysis
+# -----------------------------
+message("--- Violent Crime Correlations ---")
+cor_matrix_violent <- analysis_data %>%
+  select(pop_change_pct, income_change_pct, age_change, 
+         housing_per_capita_change, pct_renter_change, violent_change_rate) %>%
+  cor(use = "complete.obs")
+
+print(cor_matrix_violent["violent_change_rate", ])
+
+# Violent Crime Plots
+plots_violent <- lapply(names(vars_to_test), function(var) {
+  ggplot(analysis_data, aes(x = .data[[var]], y = violent_change_rate)) +
+    geom_point(alpha = 0.5, color = "#2c3e50") +
+    geom_smooth(method = "lm", color = "#e74c3c", se = FALSE) + # Red line for violent
+    labs(title = vars_to_test[[var]], y = "Change in Violent Crime Rate", x = NULL) +
+    theme_minimal()
+})
+
+# Display Violent Grid
+do.call(grid.arrange, c(plots_violent, ncol = 2, top = "Correlates of Violent Crime Change (2020-2024)"))
+
+
+# -----------------------------
+# 3. Property Crime Analysis
+# -----------------------------
+message("--- Property Crime Correlations ---")
+cor_matrix_prop <- analysis_data %>%
+  select(pop_change_pct, income_change_pct, age_change, 
+         housing_per_capita_change, pct_renter_change, property_change_rate) %>%
+  cor(use = "complete.obs")
+
+print(cor_matrix_prop["property_change_rate", ])
+
+# Property Crime Plots
+plots_prop <- lapply(names(vars_to_test), function(var) {
+  ggplot(analysis_data, aes(x = .data[[var]], y = property_change_rate)) +
+    geom_point(alpha = 0.5, color = "#2c3e50") +
+    geom_smooth(method = "lm", color = "#27ae60", se = FALSE) + # Green line for property
+    labs(title = vars_to_test[[var]], y = "Change in Property Crime Rate", x = NULL) +
+    theme_minimal()
+})
+
+# Display Property Grid
+do.call(grid.arrange, c(plots_prop, ncol = 2, top = "Correlates of Property Crime Change (2020-2024)"))
+```
+
+
+IDENTIFY OUTLIERS (FAST GROWTH/RISING VIOLENT CRIME AND POPULATION DECLINE/DECLINING CRIME)
+```{r}
+# -----------------------------
+# 1. Define Thresholds (Top/Bottom 25%)
+# -----------------------------
+# We use quantiles to define "High Growth" and "Big Drop" relative to the dataset
+pop_thresholds   <- quantile(analysis_data$pop_change_pct, probs = c(0.25, 0.75))
+crime_thresholds <- quantile(analysis_data$violent_change_rate, probs = c(0.25, 0.75))
+
+# High Growth = Top 25% of population change
+# High Crime Spike = Top 25% of violent rate increase
+# Shrinking = Bottom 25% of population change
+# Big Crime Drop = Bottom 25% of violent rate change (largest decreases)
+
+# -----------------------------
+# 2. Extract "Boom Spikes" (The Growth Paradox)
+# -----------------------------
+boom_spikes <- analysis_data %>%
+  filter(
+    pop_change_pct > pop_thresholds[2],       # High Growth
+    violent_change_rate > crime_thresholds[2] # High Crime Spike
+  ) %>%
+  arrange(desc(violent_change_rate)) %>%      # Sort by worst crime spike
+  select(city, state, 
+         pop_2024 = acs_population_2024,
+         pop_change_pct, 
+         housing_change = housing_per_capita_change,
+         violent_rate_2020 = violent_crime_per_1000_2020,
+         violent_rate_2024 = violent_crime_per_1000_2024,
+         violent_change_rate) %>%
+  mutate(
+    # Format for readability
+    pop_change_pct = scales::percent(pop_change_pct, accuracy = 0.1),
+    violent_change_rate = round(violent_change_rate, 2)
+  )
+
+# -----------------------------
+# 3. Extract "Turnaround Towns" (The Shrinkage Paradox)
+# -----------------------------
+turnaround_towns <- analysis_data %>%
+  filter(
+    pop_change_pct < pop_thresholds[1],       # Shrinking
+    violent_change_rate < crime_thresholds[1] # Big Crime Drop
+  ) %>%
+  arrange(violent_change_rate) %>%            # Sort by biggest drop (most negative)
+  select(city, state, 
+         pop_2024 = acs_population_2024,
+         pop_change_pct, 
+         housing_change = housing_per_capita_change,
+         violent_rate_2020 = violent_crime_per_1000_2020,
+         violent_rate_2024 = violent_crime_per_1000_2024,
+         violent_change_rate) %>%
+  mutate(
+    pop_change_pct = scales::percent(pop_change_pct, accuracy = 0.1),
+    violent_change_rate = round(violent_change_rate, 2)
+  )
+
+# -----------------------------
+# 4. View Results
+# -----------------------------
+message("--- BOOM SPIKES: Fast Growth + Rising Crime ---")
+print(head(boom_spikes, 10))
+
+message("\n--- TURNAROUND TOWNS: Shrinking Pop + Falling Crime ---")
+print(head(turnaround_towns, 10))
+```
+
+MAP OUTLIERS BY CATEGORY
+
+```{r}
+# Use the same add_coordinates function from before
+# (Ensure tidygeocoder is loaded)
+library(tidygeocoder)
+
+message("Geocoding Boom Spikes...")
+map_data_boom <- add_coordinates(boom_spikes)
+
+message("Geocoding Turnaround Towns...")
+map_data_turnaround <- add_coordinates(turnaround_towns)
+
+create_paradox_map <- function(data, title_text, paradox_type = "boom") {
+  
+  if(nrow(data) == 0) return(NULL)
+
+  # Color Palette
+  pal <- colorFactor(
+    palette = c("#f1c40f", "#e67e22", "#e74c3c", "#8e44ad"),
+    domain = data$pop_category
+  )
+
+  leaflet(data) %>%
+    addProviderTiles(providers$CartoDB.Positron) %>%
+    addCircleMarkers(
+      lng = ~long, lat = ~lat, radius = 7,
+      color = ~pal(pop_category),
+      stroke = TRUE, fillOpacity = 0.8, weight = 1,
+      
+      label = ~paste0(city, ", ", state),
+      
+      popup = ~paste0(
+        "<strong>", city, ", ", state, "</strong><br/>",
+        "Rank: ", rank, "<br/>",
+        "Category: ", pop_category, "<br/><hr>",
+        # Show Pop Change formatted as %
+        "Pop Change: <strong>", scales::percent(pop_change_pct, accuracy = 0.1), "</strong><br/>",
+        "Crime Rate (2020): ", round(violent_rate_2020, 1), "<br/>",
+        "Crime Rate (2024): ", round(violent_rate_2024, 1), "<br/>",
+        "<strong>Crime Change: ", round(violent_change_rate, 2), "</strong>"
+      )
+    ) %>%
+    addLegend("bottomright", pal = pal, values = ~pop_category, title = "Population Size") %>%
+    addControl(
+      html = paste0("<h3 style='margin:0; padding:10px; background:white; opacity:0.9;'>", title_text, "</h3>"),
+      position = "topright"
+    )
+}
+
+# -----------------------------
+# Generate the Maps
+# -----------------------------
+
+# Map 1: Boom Spikes (Growing Fast, Crime Spiking)
+create_paradox_map(map_data_boom, "Boom Spikes: Fast Growth + Crime Spike")
+
+# Map 2: Turnaround Towns (Shrinking, Crime Falling)
+create_paradox_map(map_data_turnaround, "Turnaround Towns: Shrinking + Safer")
+```
+
+
